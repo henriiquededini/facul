@@ -1,0 +1,196 @@
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <errno.h>
+#include <wait.h>
+#include <string.h>
+
+#define GREEN "\e[38;5;49m"
+#define BLUE "\e[38;5;33m"
+#define RESET "\x1b[0m"
+#define YELL "\e[38;5;226m"
+
+void execCommands(char *sliced[], int numpipes);                            //Declara funcao para poder referencia-la antes da implementacao
+
+char *removeSpaces(char fileName[]){                                        //Funcao remove espacos em branco no inicio e final da string
+    int i = strlen(fileName) - 1;
+    for (int j = 0; j < i; j++){                                            
+        if ((fileName[j] == 34) || (fileName[j] == 39)){                    //Caso encontre, respectivamente, " ou ' 
+            int k=j;
+            while(k<i){
+                fileName[k]=fileName[k+1];                                  //Joga para o fim da string
+                k++;
+            }
+            fileName[k]='\0';                                               //Substitui ' ou " por \0
+        }
+    }
+    while(fileName[i] == ' '){                                              //Add \0 no lugar de espacos no fim da string
+        fileName[i] = '\0';
+        i--;
+    }
+    int k=0;
+    while (fileName[k] == ' '){                                            //Muda a posicao inicial da string para o 1ro caractere != " " 
+        for(int i = 0; i < strlen(fileName); i++)
+            fileName[i] = fileName[i + 1];
+        k++;
+    }
+
+    return fileName;
+}
+
+void split(char cmd[], char *slicedCmd[], char c[]){                        //Função que recebe uma string e separa os comandos, onde ocorre char c, em um vetor de strings
+    char *aux;                                                              //*aux aponta para o local da ocorrencia de c
+    int numSlices = 0, sizeCommand = 0;                                     //NumSlices remete ao numero de comandos separados. sizeCommand recebe o strlen dos comandos
+    aux = strtok(cmd, c);                                                   //Aponta 1ro token
+
+    while (aux != NULL) {                                                   //Demais tokens
+        slicedCmd[numSlices] = aux;                                         //Armazena token anterior
+        aux = strtok(NULL, c);                                              //Aponta prox token
+        numSlices++;                                                        //Incrementa interacao
+    }
+    slicedCmd[numSlices] = NULL;                                            //Add null na ultima posição do vetor
+
+    for (int j = 0; j < numSlices; j++) {                                   //remove espacos antes e depois do comando
+        strcpy(slicedCmd[j],removeSpaces(slicedCmd[j]));
+    }
+}
+
+int countCommands(char cmd[]){                                              //Conta o número de espaços para saber qts cmds/parametros tem
+    int spaces = 0, sizeCommand = strlen(cmd);
+    for (int i = 0; i < sizeCommand; i++){
+        if ((cmd[i] == ' ') && (cmd[i+1]!=' '))  spaces++;
+    }
+    return spaces;
+}
+
+void executeOutputFileCommand(char args[], char fileName[], int x){         //Recebe comando (args) a ser executado e o arquivo fonte (fileName) para caso haja ">" ou ">>"
+    int fd0;                                                                //fd0 referenciara o arquivo
+    switch (x) {                                                            //A contagem feita no execCommands deve retornar 1 ou 2 em x
+        case 1:
+            fd0=open(fileName, O_WRONLY|O_CREAT|O_TRUNC , S_IRWXU);         //Caso a contagem seja 1, ou seja, o comando tem ">", abre o arquivo com posicao de escrita em 0
+            break;
+        case 2:
+            fd0=open(fileName, O_WRONLY|O_CREAT|O_APPEND , S_IRWXU);        //Caso a contagem seja 2, ou seja, o comando tem ">>", abre o arquivo com posicao de escrita em EOF
+            break;
+        default:
+            fprintf(stderr, "Quantidade de '>' (3) invalida: insira apenas 1 '>' ou  1 '>>' por comando\n");   //Caso a contagem exceda os limites
+            exit(EXIT_FAILURE);      
+            break;  
+    }
+    dup2(fd0, STDOUT_FILENO);                                               //Copia o conteudo do output para o fd0
+
+    char *comando[countCommands(args)];                                     //Cria ponteiro que vai lidar com a string de comandos recebida
+    split(args, comando, " ");                                              //Quebra a string de comandos nos espacos e separa em ponteiros
+    if (execvp(comando[0], comando) < 0){                                   //Execvp para o comando atual, em if para tratar erro
+        perror("Execvp executeOutput");
+        exit(EXIT_FAILURE);
+    }
+    close(STDOUT_FILENO);                                                   //Eecha IO e arquivo
+    close(STDIN_FILENO);
+    close(fd0);
+}
+
+void execCommands(char *sliced[], int numpipes){                            //Recebe comandos que foram separados em strings e o numero de pipes
+    pid_t pid;
+    
+    int pipefd[2 * numpipes];                                               //Declara 1 fd com tamanho necessário pra todos comandos, 1 posicao p entrada e 1 pra saida, logo tam = 2* num de pipes
+    //     comando0   comando1  comando2  comando3  comando4
+    //           pipefd0    pipefd1   pipefd2   pipefd3
+    //            [0,1]      [2,3]     [4,5]     [6,7]
+
+    for (int i = 0; i < numpipes; i++) {                                    //Inicializa n pipes de 2 em duas posicoes, onde n = numero de pipes do bruteCommand
+        if (pipe(pipefd + i * 2) < 0){
+            perror("Erro ao criar pipefd");                                 //Tratamento do erro
+            exit(EXIT_FAILURE);
+        }
+    }
+    int count = 0;                                                          //Count controla o caminhar das interacoes do while
+    while (count < (numpipes + 1) * 2) {                                    //While executa todos comandos recebidos. (numpipes+1)=numComandos, *2 pra compensar o passo do while que eh =+2
+        pid = fork();
+        if (pid == 0)                                                       //Filho executa
+        {
+            int numFlux = 0;                                                //NumFlux representa numero de ">"
+
+            for (int i = 0; i < strlen(sliced[count/2]); i++)               //Busca numero de ">" 
+                if ((sliced[count/2][i] == '>')) numFlux++;
+            
+            if (count != 0){                                                //Se não for o 1ro comando redireciona o input
+                if (dup2(pipefd[count - 2], STDIN_FILENO) < 0){             //Count-2=pos leitura. Dentro do if pra tratar erro
+                    perror("dup2 input");                 
+                    exit(EXIT_FAILURE);
+                }
+            }
+            if ((numpipes * 2) != count){                                   //Se for n for o ultimo, ou seja count != num de pipes, sendo num pipes *2 pra compensar o passo redireciona o output
+                if (dup2(pipefd[count + 1], STDOUT_FILENO) < 0){            //Count+1=pos escrita. Dentro do if pra tratar erro
+                    perror("dup2 output");
+                    exit(EXIT_FAILURE);
+                }
+            }
+
+            for (int i = 0; i < 2 * numpipes; i++) close(pipefd[i]);        //Fecha todos pipes dos filhos
+            
+            char *currentCommand[countCommands(sliced[count/2])];           //Cria vetor pra lidar com o comando e argumentos da posi sliced[passo]
+
+            if(numFlux>0){                                                  //Realiza o comando caso nele haja ">"
+                split(sliced[count/2], currentCommand, ">");                //Separa a string da posi sliced[passo] em comando e parametros e armazena em comandoAtual
+                executeOutputFileCommand(currentCommand[0],currentCommand[1], numFlux);//Chama funcao responsavel pela execucao com alteracao de output para arquivo
+                continue;                                                   //Pula pra prox iteracao do while
+            }
+            
+            split(sliced[count/2], currentCommand, " ");                    //Separa a string do sliced que não tem "<" nem ">"
+            
+            if (execvp(currentCommand[0], currentCommand) < 0){             //Execvp para o comando atual, em if para tratar erro
+                fprintf(stderr, "Erro ao executar %s\n", currentCommand[0]);
+                //perror("Execvp");
+                exit(EXIT_FAILURE);
+            }
+        } else if (pid < 0) {                                               //Tratando erro de fork
+            perror("Fork");
+            exit(EXIT_FAILURE);
+        }
+        count += 2;                                                         //Atualiza passo
+    }
+
+    for (int i = 0; i < 2 * numpipes; i++) close(pipefd[i]);                //Fecha pipes do pai
+
+    for (int i = 0; i < numpipes + 1; i++) wait(NULL);                      //Espera todos filhos
+}
+
+void treatCommand(char cmd[]) {                                             //Recebe comando inicial e divide por pipes
+    int cmdsize = strlen(cmd),numpipes = 0, antiFlux = 0;                   //Cmdsize guarda o tamanho do vetor. Numpipes guarda numero de pipes. AntiFlux guarda numero de "<"
+    
+    for(int i = 0; i < cmdsize; i++) if (cmd[i] == '<') antiFlux++;         //Percorre o vetor para contar os "<"
+    if(antiFlux > 0){
+    	char *sliceAux[antiFlux + 1];                                       //SliceAux guardara o subvetor do command
+    	split(cmd, sliceAux, "<");                                          //Divide o cmd em tokens de acordo com as posi de "<"
+    	for(int k=0;antiFlux > 0;k++){                                      //Concatena todas substrings de sliceAux separadas por espaco
+    		strcat(sliceAux[0], " ");
+    		strcat(sliceAux[0], sliceAux[k+1]);
+    		antiFlux--;
+    	}
+    	strcpy(cmd, sliceAux[0]);                                           //Devolve a string sem "<" para o command
+    }
+    	
+    for (int i = 0; i < cmdsize; i++) if (cmd[i] == '|') numpipes++;        //Busca numero de pipes
+    char *slicedCommand[numpipes + 1];                                      //Cria vetor do tamnho com numero de comandos (numpipes+1)
+    split(cmd, slicedCommand, "|");                                         //Quebra o input em strings pela posi dos pipes
+    execCommands(slicedCommand, numpipes);                                  //Chama função pra executar
+}
+
+int main(){                                                                 //Main
+    while (1){                                                              //While infinito para receber input no terminal
+        char bruteCommand[100];                                             //Intup de no max 100 chars
+        printf("\n"GREEN"SO-1.0 "YELL"#"RESET" ");                                              //Printa feedback de espera
+        scanf(" %99[^\n]", bruteCommand);                                   //Guarda input em bruteCommand
+        if (!strcmp("exit", bruteCommand) || !strcmp("exi", bruteCommand))  //Caso digite exit ou exi sai do shell
+            break;
+        pid_t pid = fork();                                                 //Cria filho pra lidar com os inputs
+        if (!pid){                                                          //Se pid==0 = filho executa
+            treatCommand(bruteCommand);                                     //Chama funcao responsavel pelo tratamento inicial do input
+            break;
+        } else wait(NULL);                                                  //Espera termino do filho
+    }
+    return 0;
+}
